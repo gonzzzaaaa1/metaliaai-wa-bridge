@@ -158,15 +158,18 @@ const MAX_MSG_AGE_MS  = 60 * 1000;
 
 // Debug counters — exposed via /debug
 const stats = {
-  upsertCalls: 0,   // times messages.upsert fired
-  totalMsgs: 0,     // total messages seen
+  upsertCalls: 0,
+  totalMsgs: 0,
   skippedFromMe: 0,
   skippedJid: 0,
   skippedOld: 0,
   skippedEmpty: 0,
   forwarded: 0,
-  lastMsgJid: null, // last remoteJid seen (any message)
+  lastMsgJid: null,
   lastMsgFromMe: null,
+  connectedAs: null,   // phone number / JID the bridge is logged in as
+  disconnects: 0,
+  lastDisconnectCode: null,
 };
 
 const logger = pino({ level: "silent" });
@@ -231,6 +234,8 @@ async function connectToWhatsApp() {
       const code      = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode : 0;
       const loggedOut = code === DisconnectReason.loggedOut;
+      stats.disconnects++;
+      stats.lastDisconnectCode = code;
       console.log(`[bridge] 🔴 Disconnected (code ${code}, loggedOut: ${loggedOut})`);
 
       notifyWebhook({ type: "DisconnectedCallback", connected: false });
@@ -251,7 +256,9 @@ async function connectToWhatsApp() {
       connectionState = "connected";
       connectedAt     = Date.now();
       processedIds.clear();
-      console.log("[bridge] 🟢 WhatsApp connected! (8s startup grace active)");
+      const myJid = sock.user?.id || "unknown";
+      console.log(`[bridge] 🟢 Connected as: ${myJid}`);
+      stats.connectedAs = myJid;
       notifyWebhook({ type: "ConnectedCallback", connected: true });
       await saveAuthToVercel();
     }
