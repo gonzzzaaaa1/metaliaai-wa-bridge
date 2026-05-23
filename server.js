@@ -253,12 +253,10 @@ async function connectToWhatsApp() {
 
   // ── Incoming messages ───────────────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-
-    if (Date.now() - connectedAt < STARTUP_GRACE_MS) {
-      console.log(`[bridge] ⏳ Startup grace — ignoring ${messages.length} message(s)`);
-      return;
-    }
+    // Accept both "notify" (real-time) and "append" (history sync).
+    // We discriminate using the timestamp filter below — only truly recent
+    // messages (< MAX_MSG_AGE_MS) are forwarded regardless of type.
+    if (type !== "notify" && type !== "append") return;
 
     for (const msg of messages) {
       try {
@@ -278,11 +276,14 @@ async function connectToWhatsApp() {
           }
         }
 
+        // ── Timestamp-based age filter (replaces startup grace + type filter) ──
+        // Only forward messages sent within the last MAX_MSG_AGE_MS seconds.
+        // This handles both: offline-queue flood AND startup history sync.
         const tsSec = typeof msg.messageTimestamp === "number"
           ? msg.messageTimestamp
           : Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
         if (tsSec > 0 && Date.now() - tsSec * 1000 > MAX_MSG_AGE_MS) {
-          console.log(`[bridge] 🕒 Ignoring old message (${Math.round((Date.now() - tsSec * 1000) / 1000)}s old)`);
+          console.log(`[bridge] 🕒 Ignoring old message (${Math.round((Date.now() - tsSec * 1000) / 1000)}s old, type=${type})`);
           continue;
         }
 
