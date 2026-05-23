@@ -487,15 +487,16 @@ app.post("/logout", requireSecret, async (req, res) => {
   setTimeout(connectToWhatsApp, 2000);
 });
 
-// Force fresh QR without needing API_SECRET — clears saved auth so bridge shows QR.
-// Safe: attacker can only force re-scan, not gain access.
+// Force fresh QR without needing API_SECRET.
+// Clears all saved auth and restarts the process — Railway auto-restarts it.
+// Safe: attacker can only force re-scan, not gain access to the account.
 app.post("/force-qr", async (req, res) => {
-  console.log("[bridge] 🔄 Force-QR requested — clearing auth and reconnecting");
-  try { if (sock) { sock.ev.removeAllListeners(); sock.end(undefined); } } catch {}
+  console.log("[bridge] 🔄 Force-QR — clearing auth and restarting process");
   await clearAuthFromVercel();
   if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-  setTimeout(connectToWhatsApp, 1000);
-  res.json({ ok: true, message: "Auth cleared — scan new QR in admin panel" });
+  res.json({ ok: true, message: "Auth cleared — bridge restarting, scan QR in admin panel in 10s" });
+  // Give Railway time to send the response before exiting
+  setTimeout(() => { console.log("[bridge] Exiting for clean restart"); process.exit(0); }, 500);
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
