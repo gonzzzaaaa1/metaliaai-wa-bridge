@@ -320,10 +320,28 @@ async function connectToWhatsApp() {
           continue;
         }
 
-        // Extract phone (display/storage): strip JID suffix
-        const phone      = msg.key.remoteJid.replace(/@[^@]+$/, "");
         // Keep full JID for sending back (critical for @lid accounts)
         const fullJid    = msg.key.remoteJid;
+        const isLid      = fullJid.endsWith("@lid");
+
+        // For @s.whatsapp.net: the number IS the real phone.
+        // For @lid: it's an opaque WhatsApp Linked Identifier, not a real phone number.
+        // Try to find the real phone in the contacts store first.
+        let phone = fullJid.replace(/@[^@]+$/, ""); // fallback: LID number or real phone
+
+        if (isLid && sock.contacts) {
+          // Baileys may have the real @s.whatsapp.net JID mapped from the LID in contacts
+          const contactEntry = sock.contacts[fullJid];
+          if (contactEntry) {
+            // Some Baileys builds populate a 'phone' or 'user' field on the contact
+            const altJid = contactEntry.lid ?? contactEntry.linkedIdentity ?? null;
+            if (altJid && altJid.endsWith("@s.whatsapp.net")) {
+              phone = altJid.replace("@s.whatsapp.net", "");
+              console.log(`[bridge] 🔗 Resolved LID ${fullJid} → phone ${phone}`);
+            }
+          }
+        }
+
         const m          = msg.message || {};
         const text       =
           m.conversation ||
@@ -380,8 +398,9 @@ async function connectToWhatsApp() {
 
         await notifyWebhook({
           type:        "ReceivedCallback",
-          phone,           // number only (for display/DB storage)
-          jid:       fullJid,  // full JID incl. @lid/@s.whatsapp.net (for sending back)
+          phone,           // real phone when known, LID number as fallback
+          jid:         fullJid,  // full JID incl. @lid/@s.whatsapp.net (for sending back)
+          isLid,           // true when contact uses @lid format (phone may not be real)
           fromMe:      false,
           chatName:    senderName,
           senderName,
