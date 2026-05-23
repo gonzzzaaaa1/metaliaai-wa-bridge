@@ -56,13 +56,22 @@ const logger = pino({ level: "silent" });
 
 // ── Notify Vercel webhook ─────────────────────────────────────────────────────
 async function notifyWebhook(payload) {
-  if (!WEBHOOK_URL) return;
+  if (!WEBHOOK_URL) {
+    console.warn("[bridge] ⚠️  WEBHOOK_URL not set — message NOT forwarded");
+    return;
+  }
   try {
-    await fetch(WEBHOOK_URL, {
+    const res = await fetch(WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    const text = await res.text().catch(() => "");
+    if (!res.ok) {
+      console.error(`[bridge] Webhook error ${res.status}: ${text.slice(0, 200)}`);
+    } else {
+      console.log(`[bridge] ✅ Webhook OK ${res.status} — ${text.slice(0, 120)}`);
+    }
   } catch (err) {
     console.error("[bridge] Webhook notify error:", err.message);
   }
@@ -260,7 +269,44 @@ function requireSecret(req, res, next) {
 
 // Health (no auth needed)
 app.get("/health", (req, res) => {
-  res.json({ ok: true, status: connectionState });
+  res.json({
+    ok: true,
+    status: connectionState,
+    webhookConfigured: !!WEBHOOK_URL,
+    webhookUrl: WEBHOOK_URL ? WEBHOOK_URL.replace(/\/\/[^/]+/, "//<host>") : "(not set)",
+  });
+});
+
+// Debug — show config (no auth needed, masked values)
+app.get("/debug", (req, res) => {
+  res.json({
+    connectionState,
+    webhookConfigured: !!WEBHOOK_URL,
+    webhookUrl: WEBHOOK_URL
+      ? WEBHOOK_URL.replace(/https?:\/\/[^/]+/, "https://<host>")
+      : "(not set — WEBHOOK_URL env var missing!)",
+    processedIdsCount: processedIds.size,
+    connectedAt: connectedAt ? new Date(connectedAt).toISOString() : null,
+    uptimeSec: connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : null,
+  });
+});
+
+// Test webhook — fires a fake message to verify the pipeline (no auth)
+app.post("/test-webhook", async (req, res) => {
+  const phone = req.body?.phone || "5493517000000";
+  const text  = req.body?.text  || "Mensaje de prueba desde el bridge";
+  console.log(`[bridge] 🧪 Firing test webhook for ${phone}: "${text}"`);
+  await notifyWebhook({
+    type: "ReceivedCallback",
+    phone,
+    fromMe: false,
+    chatName: "Test",
+    senderName: "Test",
+    senderPhone: phone,
+    text: { message: text },
+    momment: Date.now(),
+  });
+  res.json({ ok: true, phone, text, webhookUrl: WEBHOOK_URL || "(not set)" });
 });
 
 // Status (no auth needed — panel needs to poll this)
