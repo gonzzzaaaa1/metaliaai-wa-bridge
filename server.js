@@ -41,6 +41,12 @@ let currentQR        = null;  // raw QR string from Baileys
 let connectionState  = "disconnected"; // "disconnected" | "connecting" | "qr" | "connected"
 let sock             = null;
 let reconnectTimer   = null;
+let connectedAt      = 0;     // ms timestamp when connection opened
+
+// Anti-spam guards
+const processedIds   = new Set();       // dedup by message id
+const MAX_MSG_AGE_MS = 60 * 1000;       // ignore messages older than 60s (offline queue)
+const STARTUP_GRACE_MS = 8 * 1000;      // ignore everything for 8s after connect (history sync flood)
 
 const logger = pino({ level: "silent" });
 
@@ -109,7 +115,9 @@ async function connectToWhatsApp() {
     if (connection === "open") {
       currentQR = null;
       connectionState = "connected";
-      console.log("[bridge] 🟢 WhatsApp connected!");
+      connectedAt = Date.now();
+      processedIds.clear();
+      console.log("[bridge] 🟢 WhatsApp connected! (8s startup grace active)");
       notifyWebhook({ type: "ConnectedCallback", connected: true });
     }
   });
@@ -121,12 +129,41 @@ async function connectToWhatsApp() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
+    // ── Anti-spam: ignore the history/offline flood right after connecting ────
+    if (Date.now() - connectedAt < STARTUP_GRACE_MS) {
+      console.log(`[bridge] ⏳ Startup grace — ignoring ${messages.length} synced message(s)`);
+      return;
+    }
+
     for (const msg of messages) {
       try {
         if (msg.key.fromMe) continue;
         if (!msg.key.remoteJid) continue;
         if (isJidBroadcast(msg.key.remoteJid)) continue;
-        if (msg.key.remoteJid.endsWith("@g.us")) continue; // skip groups
+        if (msg.key.remoteJid === "status@broadcast") continue;
+        if (msg.key.remoteJid.endsWith("@g.us")) continue;       // skip groups
+        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) continue; // only 1:1 chats
+
+        // Dedup: skip if we already handled this message id
+        const msgId = msg.key.id;
+        if (msgId) {
+          if (processedIds.has(msgId)) continue;
+          processedIds.add(msgId);
+          if (processedIds.size > 1000) {
+            // keep the set bounded
+            const first = processedIds.values().next().value;
+            processedIds.delete(first);
+          }
+        }
+
+        // Skip old messages (offline queue delivered on connect)
+        const tsSec = typeof msg.messageTimestamp === "number"
+          ? msg.messageTimestamp
+          : Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
+        if (tsSec > 0 && Date.now() - tsSec * 1000 > MAX_MSG_AGE_MS) {
+          console.log(`[bridge] 🕒 Ignoring old message (${Math.round((Date.now() - tsSec * 1000) / 1000)}s old)`);
+          continue;
+        }
 
         const phone = msg.key.remoteJid.replace("@s.whatsapp.net", "");
         const text  =
