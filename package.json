@@ -1,0 +1,20 @@
+{
+  "name": "metaliaai-wa-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp bridge for Metalia AI using Baileys — deploy on Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.14",
+    "express": "^4.18.2",
+    "pino": "^8.21.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
