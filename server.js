@@ -6,10 +6,13 @@
  * Deploy on Railway (free tier).
  *
  * Required env vars:
- *   WEBHOOK_URL   — your Vercel webhook: https://metaliaai.vercel.app/api/bot/webhook
- *   API_SECRET    — any random string to protect /send endpoint
- *   DATABASE_URL  — Neon Postgres URL (same as Vercel) for auth persistence
+ *   WEBHOOK_URL   — Vercel webhook: https://metaliaai.vercel.app/api/bot/webhook
+ *   API_SECRET    — any random string to protect /send and /logout
  *   PORT          — set automatically by Railway
+ *
+ * Optional (for session persistence across redeploys):
+ *   VERCEL_AUTH_URL — set to: https://metaliaai.vercel.app/api/bridge-auth
+ *   (uses the same WA_BRIDGE_SECRET for auth — no DATABASE_URL needed)
  */
 
 const {
@@ -22,17 +25,16 @@ const {
   downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
-const express = require("express");
-const QRCode  = require("qrcode");
-const pino    = require("pino");
-const fs      = require("fs");
-const path    = require("path");
-const { Pool } = require("pg");
+const express  = require("express");
+const QRCode   = require("qrcode");
+const pino     = require("pino");
+const fs       = require("fs");
+const path     = require("path");
 
 const app = express();
 app.use(express.json({ limit: "12mb" }));
 
-// Max media size to forward to the webhook (Vercel body limit ~4.5MB → keep binary under ~3MB)
+// Max media size to forward (Vercel body limit ~4.5MB → keep binary under ~3MB)
 const MAX_MEDIA_BYTES = 3 * 1024 * 1024;
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -40,39 +42,34 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT        = process.env.PORT || 3001;
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const API_SECRET  = process.env.API_SECRET || "changeme";
-const DATABASE_URL = process.env.DATABASE_URL || "";
+const PORT         = process.env.PORT        || 3001;
+const WEBHOOK_URL  = process.env.WEBHOOK_URL || "";
+const API_SECRET   = process.env.API_SECRET  || "changeme";
+// Auth persistence via Vercel API (no DATABASE_URL needed)
+// Set VERCEL_AUTH_URL = https://metaliaai.vercel.app/api/bridge-auth
+const VERCEL_AUTH_URL = (process.env.VERCEL_AUTH_URL || "").replace(/\/$/, "");
 
-// ── Postgres client (for auth persistence) ───────────────────────────────────
-let db = null;
-if (DATABASE_URL) {
-  db = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    max: 3,
-  });
-  console.log("[bridge] ✅ Postgres connected — auth state will persist across deploys");
+if (VERCEL_AUTH_URL) {
+  console.log("[bridge] ✅ Auth persistence enabled via Vercel API");
 } else {
-  console.warn("[bridge] ⚠️  DATABASE_URL not set — auth state is ephemeral (lost on redeploy)");
+  console.warn("[bridge] ⚠️  VERCEL_AUTH_URL not set — session lost on redeploy");
+  console.warn("[bridge]    Set VERCEL_AUTH_URL=https://metaliaai.vercel.app/api/bridge-auth");
 }
 
-// ── Auth state persistence ─────────────────────────────────────────────────────
+// ── Auth state persistence via Vercel ────────────────────────────────────────
 const AUTH_DIR = "./auth_info";
 
-// Serialize auth_info directory → { "filename": "base64content", ... }
 function serializeAuthDir() {
   const files = {};
   if (!fs.existsSync(AUTH_DIR)) return files;
   function walk(dir, prefix) {
     for (const name of fs.readdirSync(dir)) {
-      const fullPath = path.join(dir, name);
-      const relPath  = prefix ? `${prefix}/${name}` : name;
-      if (fs.statSync(fullPath).isDirectory()) {
-        walk(fullPath, relPath);
+      const full = path.join(dir, name);
+      const rel  = prefix ? `${prefix}/${name}` : name;
+      if (fs.statSync(full).isDirectory()) {
+        walk(full, rel);
       } else {
-        files[relPath] = fs.readFileSync(fullPath).toString("base64");
+        files[rel] = fs.readFileSync(full).toString("base64");
       }
     }
   }
@@ -80,84 +77,85 @@ function serializeAuthDir() {
   return files;
 }
 
-// Restore auth_info directory from serialized object
 function restoreAuthDir(files) {
   if (!files || typeof files !== "object") return;
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
   for (const [rel, b64] of Object.entries(files)) {
-    const fullPath = path.join(AUTH_DIR, rel);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, Buffer.from(b64, "base64"));
+    const full = path.join(AUTH_DIR, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, Buffer.from(b64, "base64"));
   }
 }
 
-async function saveAuthToDB() {
-  if (!db) return;
+async function saveAuthToVercel() {
+  if (!VERCEL_AUTH_URL) return;
   try {
     const files = serializeAuthDir();
     if (Object.keys(files).length === 0) return;
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS wa_auth_state (
-        id TEXT PRIMARY KEY,
-        files JSONB NOT NULL,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await db.query(`
-      INSERT INTO wa_auth_state (id, files, updated_at)
-      VALUES ('metalia', $1, NOW())
-      ON CONFLICT (id) DO UPDATE SET files = $1, updated_at = NOW()
-    `, [JSON.stringify(files)]);
-    console.log(`[bridge] 💾 Auth saved to Postgres (${Object.keys(files).length} files)`);
+    const res = await fetch(VERCEL_AUTH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-bridge-secret": API_SECRET,
+      },
+      body: JSON.stringify({ files }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error("[bridge] Auth save error:", res.status, data);
+    } else {
+      console.log(`[bridge] 💾 Auth saved (${data.saved} files)`);
+    }
   } catch (err) {
     console.error("[bridge] Auth save error:", err.message);
   }
 }
 
-async function loadAuthFromDB() {
-  if (!db) return;
+async function loadAuthFromVercel() {
+  if (!VERCEL_AUTH_URL) return;
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS wa_auth_state (
-        id TEXT PRIMARY KEY,
-        files JSONB NOT NULL,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    const result = await db.query("SELECT files FROM wa_auth_state WHERE id = 'metalia'");
-    if (result.rows.length > 0) {
-      const files = result.rows[0].files;
-      restoreAuthDir(files);
-      console.log(`[bridge] 📂 Auth restored from Postgres (${Object.keys(files).length} files)`);
+    const res = await fetch(`${VERCEL_AUTH_URL}?secret=${encodeURIComponent(API_SECRET)}`, {
+      headers: { "x-bridge-secret": API_SECRET },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error("[bridge] Auth load error:", res.status);
+      return;
+    }
+    if (data.found && data.files) {
+      restoreAuthDir(data.files);
+      console.log(`[bridge] 📂 Auth restored (${Object.keys(data.files).length} files)`);
     } else {
-      console.log("[bridge] No stored auth found — will show QR");
+      console.log("[bridge] No stored auth — will show QR");
     }
   } catch (err) {
     console.error("[bridge] Auth load error:", err.message);
   }
 }
 
-async function clearAuthFromDB() {
-  if (!db) return;
+async function clearAuthFromVercel() {
+  if (!VERCEL_AUTH_URL) return;
   try {
-    await db.query("DELETE FROM wa_auth_state WHERE id = 'metalia'");
-    console.log("[bridge] 🗑️  Auth cleared from Postgres");
+    await fetch(VERCEL_AUTH_URL, {
+      method: "DELETE",
+      headers: { "x-bridge-secret": API_SECRET },
+    });
+    console.log("[bridge] 🗑️  Auth cleared");
   } catch (err) {
     console.error("[bridge] Auth clear error:", err.message);
   }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let currentQR        = null;
-let connectionState  = "disconnected";
-let sock             = null;
-let reconnectTimer   = null;
-let connectedAt      = 0;
+let currentQR       = null;
+let connectionState = "disconnected";
+let sock            = null;
+let reconnectTimer  = null;
+let connectedAt     = 0;
 
-// Anti-spam guards
 const processedIds   = new Set();
-const MAX_MSG_AGE_MS = 60 * 1000;     // ignore messages older than 60s (offline queue)
-const STARTUP_GRACE_MS = 8 * 1000;   // ignore everything for 8s after connect (history sync)
+const MAX_MSG_AGE_MS  = 60 * 1000;
+const STARTUP_GRACE_MS = 8 * 1000;
 
 const logger = pino({ level: "silent" });
 
@@ -168,10 +166,10 @@ async function notifyWebhook(payload) {
     return;
   }
   try {
-    const res = await fetch(WEBHOOK_URL, {
-      method: "POST",
+    const res  = await fetch(WEBHOOK_URL, {
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body:    JSON.stringify(payload),
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
@@ -189,11 +187,10 @@ async function connectToWhatsApp() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   connectionState = "connecting";
 
-  // Restore auth state from Postgres before loading from disk
-  await loadAuthFromDB();
+  await loadAuthFromVercel();
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version }          = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
@@ -201,29 +198,28 @@ async function connectToWhatsApp() {
     printQRInTerminal: true,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
+      keys:  makeCacheableSignalKeyStore(state.keys, logger),
     },
     generateHighQualityLinkPreview: false,
   });
 
-  // ── Connection updates ────────────────────────────────────────────────────
+  // ── Connection updates ──────────────────────────────────────────────────────
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      currentQR = qr;
+      currentQR       = qr;
       connectionState = "qr";
       console.log("[bridge] 📱 QR ready — scan in admin panel");
     }
 
     if (connection === "close") {
-      currentQR = null;
+      currentQR       = null;
       connectionState = "disconnected";
-      const statusCode = lastDisconnect?.error instanceof Boom
-        ? lastDisconnect.error.output?.statusCode
-        : 0;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log(`[bridge] 🔴 Disconnected (code ${statusCode}, loggedOut: ${loggedOut})`);
+      const code      = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output?.statusCode : 0;
+      const loggedOut = code === DisconnectReason.loggedOut;
+      console.log(`[bridge] 🔴 Disconnected (code ${code}, loggedOut: ${loggedOut})`);
 
       notifyWebhook({ type: "DisconnectedCallback", connected: false });
 
@@ -232,39 +228,35 @@ async function connectToWhatsApp() {
         reconnectTimer = setTimeout(connectToWhatsApp, 5000);
       } else {
         console.log("[bridge] Logged out — will show QR on next connect");
-        await clearAuthFromDB();
-        // Clear local files too
+        await clearAuthFromVercel();
         if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         reconnectTimer = setTimeout(connectToWhatsApp, 2000);
       }
     }
 
     if (connection === "open") {
-      currentQR = null;
+      currentQR       = null;
       connectionState = "connected";
-      connectedAt = Date.now();
+      connectedAt     = Date.now();
       processedIds.clear();
       console.log("[bridge] 🟢 WhatsApp connected! (8s startup grace active)");
       notifyWebhook({ type: "ConnectedCallback", connected: true });
-      // Save auth to Postgres so it survives redeploys
-      await saveAuthToDB();
+      await saveAuthToVercel();
     }
   });
 
-  // ── Save credentials ──────────────────────────────────────────────────────
+  // ── Save credentials ────────────────────────────────────────────────────────
   sock.ev.on("creds.update", async () => {
     await saveCreds();
-    // Also persist to Postgres
-    await saveAuthToDB();
+    await saveAuthToVercel();
   });
 
-  // ── Incoming messages ─────────────────────────────────────────────────────
+  // ── Incoming messages ───────────────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
-    // ── Anti-spam: ignore the history/offline flood right after connecting ────
     if (Date.now() - connectedAt < STARTUP_GRACE_MS) {
-      console.log(`[bridge] ⏳ Startup grace — ignoring ${messages.length} synced message(s)`);
+      console.log(`[bridge] ⏳ Startup grace — ignoring ${messages.length} message(s)`);
       return;
     }
 
@@ -274,21 +266,18 @@ async function connectToWhatsApp() {
         if (!msg.key.remoteJid) continue;
         if (isJidBroadcast(msg.key.remoteJid)) continue;
         if (msg.key.remoteJid === "status@broadcast") continue;
-        if (msg.key.remoteJid.endsWith("@g.us")) continue;       // skip groups
-        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) continue; // only 1:1 chats
+        if (msg.key.remoteJid.endsWith("@g.us")) continue;
+        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) continue;
 
-        // Dedup: skip if we already handled this message id
         const msgId = msg.key.id;
         if (msgId) {
           if (processedIds.has(msgId)) continue;
           processedIds.add(msgId);
           if (processedIds.size > 1000) {
-            const first = processedIds.values().next().value;
-            processedIds.delete(first);
+            processedIds.delete(processedIds.values().next().value);
           }
         }
 
-        // Skip old messages (offline queue delivered on connect)
         const tsSec = typeof msg.messageTimestamp === "number"
           ? msg.messageTimestamp
           : Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
@@ -297,19 +286,17 @@ async function connectToWhatsApp() {
           continue;
         }
 
-        const phone = msg.key.remoteJid.replace("@s.whatsapp.net", "");
-        const m = msg.message || {};
-        const text =
+        const phone      = msg.key.remoteJid.replace("@s.whatsapp.net", "");
+        const m          = msg.message || {};
+        const text       =
           m.conversation ||
           m.extendedTextMessage?.text ||
           m.imageMessage?.caption ||
           m.videoMessage?.caption ||
           m.documentMessage?.caption ||
           "";
-
         const senderName = msg.pushName || "Cliente";
 
-        // ── Detect & download media ───────────────────────────────────────────
         let media;
         const mediaNode =
           (m.imageMessage    && { node: m.imageMessage,    kind: "image" }) ||
@@ -320,8 +307,8 @@ async function connectToWhatsApp() {
           null;
 
         if (mediaNode) {
-          const mimetype = mediaNode.node.mimetype || "application/octet-stream";
-          const fileLen  = Number(mediaNode.node.fileLength || 0);
+          const mimetype      = mediaNode.node.mimetype || "application/octet-stream";
+          const fileLen       = Number(mediaNode.node.fileLength || 0);
           const geminiReadable = /^(image\/|application\/pdf|audio\/)/i.test(mimetype);
           if (geminiReadable && (fileLen === 0 || fileLen <= MAX_MEDIA_BYTES)) {
             try {
@@ -375,25 +362,21 @@ async function connectToWhatsApp() {
 // ── Middleware: API key protection ────────────────────────────────────────────
 function requireSecret(req, res, next) {
   const secret = req.headers["x-api-secret"] || req.query.secret;
-  if (secret !== API_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (secret !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Health (no auth needed)
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     status: connectionState,
     webhookConfigured: !!WEBHOOK_URL,
-    dbConfigured: !!DATABASE_URL,
+    authPersist: !!VERCEL_AUTH_URL,
   });
 });
 
-// Status (no auth needed — panel needs to poll this)
 app.get("/status", (req, res) => {
   res.json({
     status: connectionState,
@@ -402,7 +385,6 @@ app.get("/status", (req, res) => {
   });
 });
 
-// Debug — show config (no auth needed, masked values)
 app.get("/debug", (req, res) => {
   res.json({
     connectionState,
@@ -410,14 +392,13 @@ app.get("/debug", (req, res) => {
     webhookUrl: WEBHOOK_URL
       ? WEBHOOK_URL.replace(/https?:\/\/[^/]+/, "https://<host>")
       : "(not set — WEBHOOK_URL env var missing!)",
-    dbConfigured: !!DATABASE_URL,
+    authPersist: !!VERCEL_AUTH_URL,
     processedIdsCount: processedIds.size,
     connectedAt: connectedAt ? new Date(connectedAt).toISOString() : null,
     uptimeSec:   connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : null,
   });
 });
 
-// Test webhook — fires a fake message to verify the pipeline (no auth)
 app.post("/test-webhook", async (req, res) => {
   const phone = req.body?.phone || "5493517000000";
   const text  = req.body?.text  || "Mensaje de prueba desde el bridge";
@@ -435,15 +416,12 @@ app.post("/test-webhook", async (req, res) => {
   res.json({ ok: true, phone, text, webhookUrl: WEBHOOK_URL || "(not set)" });
 });
 
-// QR code image as base64 data URL
 app.get("/qr", async (req, res) => {
   if (!currentQR) {
     return res.status(404).json({
       error:  "No QR available",
       status: connectionState,
-      hint:   connectionState === "connected"
-        ? "Already connected"
-        : "Starting up, try again in a few seconds",
+      hint:   connectionState === "connected" ? "Already connected" : "Starting up, try again in a few seconds",
     });
   }
   try {
@@ -454,12 +432,9 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// Send message (protected)
 app.post("/send", requireSecret, async (req, res) => {
   const { phone, message } = req.body;
-  if (!phone || !message) {
-    return res.status(400).json({ error: "phone and message required" });
-  }
+  if (!phone || !message) return res.status(400).json({ error: "phone and message required" });
   if (connectionState !== "connected" || !sock) {
     return res.status(503).json({ error: "WhatsApp not connected", status: connectionState });
   }
@@ -473,10 +448,9 @@ app.post("/send", requireSecret, async (req, res) => {
   }
 });
 
-// Logout (reset session — protected)
 app.post("/logout", requireSecret, async (req, res) => {
   try { if (sock) await sock.logout(); } catch { /* ignore */ }
-  await clearAuthFromDB();
+  await clearAuthFromVercel();
   if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   res.json({ ok: true, message: "Logged out — scan QR to reconnect" });
   setTimeout(connectToWhatsApp, 2000);
@@ -488,5 +462,5 @@ connectToWhatsApp().catch(console.error);
 app.listen(PORT, () => {
   console.log(`[bridge] 🚀 Running on port ${PORT}`);
   console.log(`[bridge] Webhook URL: ${WEBHOOK_URL || "(not set)"}`);
-  console.log(`[bridge] DB persistence: ${DATABASE_URL ? "enabled" : "disabled"}`);
+  console.log(`[bridge] Auth persist: ${VERCEL_AUTH_URL ? "enabled" : "disabled"}`);
 });
