@@ -320,8 +320,10 @@ async function connectToWhatsApp() {
           continue;
         }
 
-        // Extract phone: strip @s.whatsapp.net, @lid, or any other suffix
+        // Extract phone (display/storage): strip JID suffix
         const phone      = msg.key.remoteJid.replace(/@[^@]+$/, "");
+        // Keep full JID for sending back (critical for @lid accounts)
+        const fullJid    = msg.key.remoteJid;
         const m          = msg.message || {};
         const text       =
           m.conversation ||
@@ -378,7 +380,8 @@ async function connectToWhatsApp() {
 
         await notifyWebhook({
           type:        "ReceivedCallback",
-          phone,
+          phone,           // number only (for display/DB storage)
+          jid:       fullJid,  // full JID incl. @lid/@s.whatsapp.net (for sending back)
           fromMe:      false,
           chatName:    senderName,
           senderName,
