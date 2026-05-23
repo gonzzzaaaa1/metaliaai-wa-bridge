@@ -18,6 +18,7 @@ const {
   fetchLatestBaileysVersion,
   isJidBroadcast,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const express = require("express");
@@ -25,7 +26,10 @@ const QRCode = require("qrcode");
 const pino = require("pino");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "12mb" }));
+
+// Max media size to forward to the webhook (Vercel body limit ~4.5MB → keep binary under ~3MB)
+const MAX_MEDIA_BYTES = 3 * 1024 * 1024;
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-api-secret");
@@ -166,16 +170,62 @@ async function connectToWhatsApp() {
         }
 
         const phone = msg.key.remoteJid.replace("@s.whatsapp.net", "");
+        const m = msg.message || {};
         const text  =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          msg.message?.videoMessage?.caption ||
+          m.conversation ||
+          m.extendedTextMessage?.text ||
+          m.imageMessage?.caption ||
+          m.videoMessage?.caption ||
+          m.documentMessage?.caption ||
           "";
 
         const senderName = msg.pushName || "Cliente";
 
-        console.log(`[bridge] 📩 ${senderName} (${phone}): "${text || "[media]"}"`);
+        // ── Detect & download media ───────────────────────────────────────────
+        let media; // { mimetype, data(base64), filename, caption, kind }
+        const mediaNode =
+          (m.imageMessage    && { node: m.imageMessage,    kind: "image" }) ||
+          (m.documentMessage && { node: m.documentMessage, kind: "document" }) ||
+          (m.audioMessage    && { node: m.audioMessage,    kind: "audio" }) ||
+          (m.videoMessage    && { node: m.videoMessage,    kind: "video" }) ||
+          (m.stickerMessage  && { node: m.stickerMessage,  kind: "sticker" }) ||
+          null;
+
+        if (mediaNode) {
+          const mimetype = mediaNode.node.mimetype || "application/octet-stream";
+          const fileLen = Number(mediaNode.node.fileLength || 0);
+          // Only download types Gemini can read, and within size limit
+          const geminiReadable = /^(image\/|application\/pdf|audio\/)/i.test(mimetype);
+          if (geminiReadable && (fileLen === 0 || fileLen <= MAX_MEDIA_BYTES)) {
+            try {
+              const buffer = await downloadMediaMessage(
+                msg, "buffer", {},
+                { logger, reuploadRequest: sock.updateMediaMessage }
+              );
+              if (buffer && buffer.length <= MAX_MEDIA_BYTES) {
+                media = {
+                  mimetype,
+                  data: buffer.toString("base64"),
+                  filename: mediaNode.node.fileName || undefined,
+                  caption: mediaNode.node.caption || undefined,
+                  kind: mediaNode.kind,
+                };
+              } else {
+                media = { mimetype, data: "", kind: mediaNode.kind, tooLarge: true };
+              }
+            } catch (e) {
+              console.error("[bridge] media download failed:", e.message);
+              media = { mimetype, data: "", kind: mediaNode.kind };
+            }
+          } else {
+            // Not downloadable (too big or unsupported) — just flag the kind
+            media = { mimetype, data: "", kind: mediaNode.kind, tooLarge: fileLen > MAX_MEDIA_BYTES };
+          }
+        }
+
+        if (!text && !media) continue; // nothing to forward
+
+        console.log(`[bridge] 📩 ${senderName} (${phone}): "${text || "[" + (media?.kind || "media") + "]"}"`);
 
         // Forward to Vercel
         await notifyWebhook({
@@ -186,6 +236,8 @@ async function connectToWhatsApp() {
           senderName,
           senderPhone: phone,
           text:        text ? { message: text } : undefined,
+          media:       media && media.data ? media : undefined,
+          mediaKind:   media ? media.kind : undefined,
           momment:     Date.now(),
         });
       } catch (err) {
