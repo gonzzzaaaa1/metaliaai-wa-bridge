@@ -155,7 +155,19 @@ let connectedAt     = 0;
 
 const processedIds   = new Set();
 const MAX_MSG_AGE_MS  = 60 * 1000;
-const STARTUP_GRACE_MS = 8 * 1000;
+
+// Debug counters — exposed via /debug
+const stats = {
+  upsertCalls: 0,   // times messages.upsert fired
+  totalMsgs: 0,     // total messages seen
+  skippedFromMe: 0,
+  skippedJid: 0,
+  skippedOld: 0,
+  skippedEmpty: 0,
+  forwarded: 0,
+  lastMsgJid: null, // last remoteJid seen (any message)
+  lastMsgFromMe: null,
+};
 
 const logger = pino({ level: "silent" });
 
@@ -253,19 +265,27 @@ async function connectToWhatsApp() {
 
   // ── Incoming messages ───────────────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    stats.upsertCalls++;
+    console.log(`[bridge] 📥 messages.upsert type=${type} count=${messages.length}`);
+
     // Accept both "notify" (real-time) and "append" (history sync).
     // We discriminate using the timestamp filter below — only truly recent
     // messages (< MAX_MSG_AGE_MS) are forwarded regardless of type.
     if (type !== "notify" && type !== "append") return;
 
     for (const msg of messages) {
+      stats.totalMsgs++;
+      stats.lastMsgJid = msg.key?.remoteJid || null;
+      stats.lastMsgFromMe = msg.key?.fromMe ?? null;
+      console.log(`[bridge] 📨 msg jid=${msg.key?.remoteJid} fromMe=${msg.key?.fromMe} type=${type}`);
+
       try {
-        if (msg.key.fromMe) continue;
-        if (!msg.key.remoteJid) continue;
-        if (isJidBroadcast(msg.key.remoteJid)) continue;
-        if (msg.key.remoteJid === "status@broadcast") continue;
-        if (msg.key.remoteJid.endsWith("@g.us")) continue;
-        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) continue;
+        if (msg.key.fromMe) { stats.skippedFromMe++; continue; }
+        if (!msg.key.remoteJid) { stats.skippedJid++; continue; }
+        if (isJidBroadcast(msg.key.remoteJid)) { stats.skippedJid++; continue; }
+        if (msg.key.remoteJid === "status@broadcast") { stats.skippedJid++; continue; }
+        if (msg.key.remoteJid.endsWith("@g.us")) { stats.skippedJid++; continue; }
+        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) { stats.skippedJid++; continue; }
 
         const msgId = msg.key.id;
         if (msgId) {
@@ -283,7 +303,8 @@ async function connectToWhatsApp() {
           ? msg.messageTimestamp
           : Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
         if (tsSec > 0 && Date.now() - tsSec * 1000 > MAX_MSG_AGE_MS) {
-          console.log(`[bridge] 🕒 Ignoring old message (${Math.round((Date.now() - tsSec * 1000) / 1000)}s old, type=${type})`);
+          stats.skippedOld++;
+          console.log(`[bridge] 🕒 Old msg skipped (${Math.round((Date.now() - tsSec * 1000) / 1000)}s, type=${type})`);
           continue;
         }
 
@@ -337,8 +358,9 @@ async function connectToWhatsApp() {
           }
         }
 
-        if (!text && !media) continue;
+        if (!text && !media) { stats.skippedEmpty++; continue; }
 
+        stats.forwarded++;
         console.log(`[bridge] 📩 ${senderName} (${phone}): "${text || "[" + (media?.kind || "media") + "]"}"`);
 
         await notifyWebhook({
@@ -397,6 +419,7 @@ app.get("/debug", (req, res) => {
     processedIdsCount: processedIds.size,
     connectedAt: connectedAt ? new Date(connectedAt).toISOString() : null,
     uptimeSec:   connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : null,
+    stats,
   });
 });
 
