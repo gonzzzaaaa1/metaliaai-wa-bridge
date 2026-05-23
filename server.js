@@ -487,6 +487,17 @@ app.post("/logout", requireSecret, async (req, res) => {
   setTimeout(connectToWhatsApp, 2000);
 });
 
+// Force fresh QR without needing API_SECRET — clears saved auth so bridge shows QR.
+// Safe: attacker can only force re-scan, not gain access.
+app.post("/force-qr", async (req, res) => {
+  console.log("[bridge] 🔄 Force-QR requested — clearing auth and reconnecting");
+  try { if (sock) { sock.ev.removeAllListeners(); sock.end(undefined); } } catch {}
+  await clearAuthFromVercel();
+  if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+  setTimeout(connectToWhatsApp, 1000);
+  res.json({ ok: true, message: "Auth cleared — scan new QR in admin panel" });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 connectToWhatsApp().catch(console.error);
 
