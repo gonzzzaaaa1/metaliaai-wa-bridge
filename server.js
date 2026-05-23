@@ -292,7 +292,12 @@ async function connectToWhatsApp() {
         if (isJidBroadcast(msg.key.remoteJid)) { stats.skippedJid++; continue; }
         if (msg.key.remoteJid === "status@broadcast") { stats.skippedJid++; continue; }
         if (msg.key.remoteJid.endsWith("@g.us")) { stats.skippedJid++; continue; }
-        if (!msg.key.remoteJid.endsWith("@s.whatsapp.net")) { stats.skippedJid++; continue; }
+        // Accept @s.whatsapp.net AND @lid (newer WhatsApp JID format for some accounts)
+        const jid = msg.key.remoteJid;
+        if (!jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@lid")) {
+          stats.skippedJid++;
+          continue;
+        }
 
         const msgId = msg.key.id;
         if (msgId) {
@@ -315,7 +320,8 @@ async function connectToWhatsApp() {
           continue;
         }
 
-        const phone      = msg.key.remoteJid.replace("@s.whatsapp.net", "");
+        // Extract phone: strip @s.whatsapp.net, @lid, or any other suffix
+        const phone      = msg.key.remoteJid.replace(/@[^@]+$/, "");
         const m          = msg.message || {};
         const text       =
           m.conversation ||
